@@ -3,6 +3,7 @@ package com.github.xingjianluo.extensionregistryjava.extension;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -28,10 +29,21 @@ import org.slf4j.LoggerFactory;
  * 故障扩展永远不可被启用、不可被调用。
  *
  * <h3>并发安全与稳定性</h3>
- * 注册由 {@link ReentrantLock} 串行化；对外可见状态保存在不可变快照中并以
- * {@code volatile} 发布，注册与调用可并发，查询始终看到某一次完整装配的一致视图。
+ * 注册、运行期增删由 {@link ReentrantLock} 串行化；对外可见状态保存在不可变快照中并以
+ * {@code volatile} 发布，注册/增删与调用可并发，查询始终看到某一次完整装配的一致视图。
  * 所有扩展仅在装配时初始化一次；{@link #setEnabled(String, boolean)} 只切换开关，
  * 不重复初始化、不清理或重建任何扩展状态。
+ *
+ * <h3>运行期动态增删</h3>
+ * <ul>
+ *   <li>{@link #addAll(List)}：原子新增，校验或初始化任一失败整批回滚，调整前视图照常可用；
+ *       既有扩展不重复初始化、启用状态保留；</li>
+ *   <li>{@link #unregister(String)} / {@link #unregisterAll(List)}：原子下线，从查询与调用中
+ *       彻底消失；仍被保留扩展依赖时以 {@link ExtensionInUseException} 拒绝整批；</li>
+ *   <li>同一 id 移除后再加入一律按“新实例”语义：必须重新提交扩展对象并重新初始化，
+ *       注册表不缓存已下线实例，不存在同一标识两个实例或状态残留；</li>
+ *   <li>调整后的装配顺序与启动期静态装配使用同一套确定性规则（依赖优先 → 声明顺序 → id）。</li>
+ * </ul>
  */
 public final class ExtensionRegistry {
 
@@ -51,13 +63,128 @@ public final class ExtensionRegistry {
     }
 
     /**
-     * 校验、排序并初始化一批扩展，随后以不可变快照原子发布。
+     * 启动期/编程式注册：校验、排序并初始化一批扩展，随后以不可变快照原子发布。
+     *
+     * <p>保留既有语义：新增扩展初始化失败采用<b>故障隔离</b>——失败扩展标记为
+     * {@link ExtensionState#FAILED} 强制禁用，其余扩展照常装配。
      *
      * @throws DuplicateExtensionException 存在重复扩展标识
      * @throws DanglingDependencyException 存在未注册的依赖
      * @throws DependencyCycleException    依赖关系成环
      */
     public void registerAll(List<? extends Extension<?, ?>> extensions) {
+        commitAdditions(extensions, true);
+    }
+
+    /**
+     * 运行期原子新增一批扩展：新增者按与启动期完全相同的依赖与顺序规则参与装配。
+     *
+     * <p>与 {@link #registerAll} 的唯一差别是失败策略：运行期调整必须保证调用方只能看到
+     * “调整前”或“调整后”其中一个完整视图，因此本方法采用<b>整批事务</b>语义——
+     * 校验（重复 id / 悬空依赖 / 依赖环）或任一新增扩展初始化失败时，整批不发布，
+     * 调整前视图保持原样可用，已尝试初始化的实例被丢弃（不进入注册表）。
+     *
+     * @throws DuplicateExtensionException      存在重复扩展标识（批内或与已注册重复）
+     * @throws DanglingDependencyException      存在未注册的依赖
+     * @throws DependencyCycleException         新增后依赖关系成环
+     * @throws ExtensionInitializationException 新增扩展初始化失败，整批回滚
+     */
+    public void addAll(List<? extends Extension<?, ?>> extensions) {
+        commitAdditions(extensions, false);
+    }
+
+    /**
+     * 运行期原子新增单个扩展，语义等同于 {@link #addAll(List)} 传入单元素列表。
+     */
+    public void add(Extension<?, ?> extension) {
+        addAll(List.of(extension));
+    }
+
+    /**
+     * 运行期原子下线一批扩展（也可经 {@link #unregister(String)} 单个下线）。
+     *
+     * <p>下线后，这些扩展从其扩展点的查询与调用结果中彻底消失；未被影响的扩展实例、
+     * 初始化状态与启用开关一律保留，不重复初始化。装配顺序对剩余扩展重新按统一规则计算。
+     *
+     * <p>依赖保护：只要仍有<b>保留下来的</b>扩展依赖某个待下线扩展，本次整批请求被拒绝
+     * （{@link ExtensionInUseException}），不做任何部分下线，依赖关系不会被破坏。
+     * 同一扩展之后重新加入时按“新实例”处理：需要重新注册一个扩展对象并重新初始化，
+     * 旧对象及其状态不会被复用或残留（见 {@link #addAll}）。
+     *
+     * @throws ExtensionNotRegisteredException 待下线 id 未注册或已下线
+     * @throws IllegalArgumentException        下线列表内出现重复 id
+     * @throws ExtensionInUseException         待下线扩展仍被保留扩展依赖
+     */
+    public void unregisterAll(List<String> ids) {
+        Objects.requireNonNull(ids, "ids");
+        List<String> removals = new ArrayList<>(ids);
+        for (String id : removals) {
+            Objects.requireNonNull(id, "extension id");
+        }
+
+        lock.lock();
+        try {
+            Snapshot current = this.snapshot;
+
+            Set<String> removalSet = new LinkedHashSet<>();
+            for (String id : removals) {
+                if (!removalSet.add(id)) {
+                    throw new IllegalArgumentException("下线请求中存在重复的扩展标识: '" + id + "'");
+                }
+                if (!current.byId.containsKey(id)) {
+                    throw new ExtensionNotRegisteredException(
+                            "扩展标识未注册或已下线，无法下线: '" + id + "'", id);
+                }
+            }
+
+            // 依赖保护：对每个待下线扩展，找出仍然保留且依赖它的扩展；非空即拒绝整批。
+            for (String id : removalSet) {
+                List<String> dependents = new ArrayList<>();
+                for (String other : current.order) {
+                    if (removalSet.contains(other)) {
+                        continue; // 同批一起下线的扩展之间不算“仍在依赖”
+                    }
+                    if (current.byId.get(other).dependencies().contains(id)) {
+                        dependents.add(other);
+                    }
+                }
+                if (!dependents.isEmpty()) {
+                    throw new ExtensionInUseException(
+                            "扩展 '" + id + "' 仍被已注册扩展 " + dependents
+                                    + " 依赖，拒绝下线（请先下线依赖方）", id, dependents);
+                }
+            }
+
+            Map<String, Extension<?, ?>> mergedExtensions = new LinkedHashMap<>(current.byId);
+            Map<String, Boolean> mergedEnabled = new LinkedHashMap<>(current.enabled);
+            Map<String, InitOutcome> mergedOutcomes = new LinkedHashMap<>(current.outcomes);
+            for (String id : removalSet) {
+                mergedExtensions.remove(id);
+                mergedEnabled.remove(id);
+                mergedOutcomes.remove(id);
+            }
+
+            // 兜底校验：经依赖保护后理论上不会再出现悬空依赖，这里再统一校验一次。
+            checkDangling(mergedExtensions);
+            List<String> order = topoSort(mergedExtensions);
+
+            Snapshot next = publish(order, mergedExtensions, mergedOutcomes, mergedEnabled);
+            log.info("运行期下线完成: 移除 {} 个扩展 {}，剩余 {} 个；未受影响扩展保持原实例/状态/开关",
+                    removalSet.size(), removalSet, next.order.size());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 运行期下线单个扩展，语义同 {@link #unregisterAll(List)}。
+     */
+    public void unregister(String id) {
+        unregisterAll(List.of(Objects.requireNonNull(id, "id")));
+    }
+
+    private void commitAdditions(List<? extends Extension<?, ?>> extensions,
+                                 boolean isolateInitFailures) {
         Objects.requireNonNull(extensions, "extensions");
         List<Extension<?, ?>> incoming = new ArrayList<>(extensions);
         for (Extension<?, ?> e : incoming) {
@@ -70,9 +197,8 @@ public final class ExtensionRegistry {
         try {
             Snapshot current = this.snapshot;
 
-            // 1. 重复标识校验（批内 + 与已注册集合）。
-            Map<String, Boolean> mergedEnabled = new LinkedHashMap<>(current.enabled);
             Map<String, Extension<?, ?>> mergedExtensions = new LinkedHashMap<>(current.byId);
+            Map<String, Boolean> mergedEnabled = new LinkedHashMap<>(current.enabled);
             for (Extension<?, ?> e : incoming) {
                 if (mergedExtensions.containsKey(e.id())) {
                     throw new DuplicateExtensionException(
@@ -82,56 +208,98 @@ public final class ExtensionRegistry {
                 mergedEnabled.putIfAbsent(e.id(), Boolean.TRUE);
             }
 
-            // 2. 悬空依赖校验。
-            for (Extension<?, ?> e : incoming) {
-                for (String dep : e.dependencies()) {
-                    if (!mergedExtensions.containsKey(dep)) {
-                        throw new DanglingDependencyException(
-                                "扩展 '" + e.id() + "' 声明的依赖 '" + dep + "' 未注册（悬空依赖）");
-                    }
-                }
-            }
+            checkDangling(mergedExtensions);
+            List<String> order = topoSort(mergedExtensions);
 
-            // 3. 确定性拓扑排序（内部检测依赖环）。
-            List<TopologicalSorter.SortableExtension> sortable = new ArrayList<>();
-            for (Extension<?, ?> e : mergedExtensions.values()) {
-                sortable.add(new TopologicalSorter.SortableExtension(
-                        e.id(), e.order(), Set.copyOf(e.dependencies())));
-            }
-            List<String> order = TopologicalSorter.sort(sortable);
-
-            // 4. 逐个初始化，故障隔离；保留既有扩展的既有状态。
+            // 仅初始化新增扩展；既有扩展保持原实例与状态，绝不重复初始化。
             Map<String, InitOutcome> outcomes = new LinkedHashMap<>(current.outcomes);
             for (String id : order) {
                 if (current.byId.containsKey(id)) {
-                    continue; // 已初始化过的扩展不重复初始化
+                    continue;
                 }
                 Extension<?, ?> extension = mergedExtensions.get(id);
                 InitOutcome outcome = initializeOne(extension);
-                outcomes.put(id, outcome);
                 if (outcome.state() == ExtensionState.FAILED) {
-                    // 故障扩展强制禁用，但不影响其它扩展。
-                    mergedEnabled.put(id, Boolean.FALSE);
+                    if (isolateInitFailures) {
+                        // 启动期语义：故障隔离，失败扩展强制禁用，其它扩展照常。
+                        mergedEnabled.put(id, Boolean.FALSE);
+                    } else {
+                        // 运行期语义：整批回滚，快照保持调整前视图，已初始化实例一并丢弃。
+                        log.error("运行期新增批次中扩展 '{}' 初始化失败，整批未生效（回滚到调整前视图）: {}",
+                                id, outcome.failure());
+                        throw new ExtensionInitializationException(
+                                "运行期新增扩展 '" + id + "' 初始化失败，整批新增未生效，注册表保持调整前状态",
+                                id, outcome.failure());
+                    }
                 }
+                outcomes.put(id, outcome);
             }
 
-            // 5. 构建并原子发布不可变快照。
-            Map<String, List<String>> byPoint = new LinkedHashMap<>();
-            for (String id : order) {
-                String point = mergedExtensions.get(id).point();
-                byPoint.computeIfAbsent(point, k -> new ArrayList<>()).add(id);
-            }
-            Snapshot next = new Snapshot(
-                    List.copyOf(order),
-                    Collections.unmodifiableMap(mergedExtensions),
-                    Collections.unmodifiableMap(byPoint),
-                    Collections.unmodifiableMap(outcomes),
-                    Collections.unmodifiableMap(new LinkedHashMap<>(mergedEnabled)));
-            this.snapshot = next;
-            logAssembly(next);
+            Snapshot next = publish(order, mergedExtensions, outcomes, mergedEnabled);
+            log.info("运行期新增完成: 新增 {} 个扩展 {}，当前共 {} 个；既有扩展未重复初始化、开关状态保留",
+                    incoming.size(),
+                    incoming.stream().map(Extension::id).toList(),
+                    next.order.size());
         } finally {
             lock.unlock();
         }
+    }
+
+    private void checkDangling(Map<String, Extension<?, ?>> mergedExtensions) {
+        for (Extension<?, ?> e : mergedExtensions.values()) {
+            for (String dep : e.dependencies()) {
+                if (!mergedExtensions.containsKey(dep)) {
+                    throw new DanglingDependencyException(
+                            "扩展 '" + e.id() + "' 声明的依赖 '" + dep + "' 未注册（悬空依赖）");
+                }
+            }
+        }
+    }
+
+    private List<String> topoSort(Map<String, Extension<?, ?>> mergedExtensions) {
+        List<TopologicalSorter.SortableExtension> sortable = new ArrayList<>();
+        for (Extension<?, ?> e : mergedExtensions.values()) {
+            sortable.add(new TopologicalSorter.SortableExtension(
+                    e.id(), e.order(), Set.copyOf(e.dependencies())));
+        }
+        return TopologicalSorter.sort(sortable);
+    }
+
+    private Snapshot publish(List<String> order,
+                             Map<String, Extension<?, ?>> mergedExtensions,
+                             Map<String, InitOutcome> outcomes,
+                             Map<String, Boolean> mergedEnabled) {
+        Map<String, List<String>> byPoint = new LinkedHashMap<>();
+        for (String id : order) {
+            String point = mergedExtensions.get(id).point();
+            byPoint.computeIfAbsent(point, k -> new ArrayList<>()).add(id);
+        }
+        Snapshot next = new Snapshot(
+                List.copyOf(order),
+                Collections.unmodifiableMap(mergedExtensions),
+                Collections.unmodifiableMap(byPoint),
+                Collections.unmodifiableMap(outcomes),
+                Collections.unmodifiableMap(new LinkedHashMap<>(mergedEnabled)));
+        this.snapshot = next;
+        logAssembly(next);
+        return next;
+    }
+
+    /**
+     * 基于同一份不可变快照返回某扩展点上的“描述 + 实例”绑定，供调用器使用，
+     * 避免描述列表与实例取自两次不同快照。
+     */
+    List<ResolvedExtension> resolveExtensions(String point) {
+        Snapshot s = this.snapshot;
+        List<ResolvedExtension> result = new ArrayList<>();
+        for (String id : s.byPoint.getOrDefault(point, List.of())) {
+            result.add(new ResolvedExtension(describe(s, id), s.byId.get(id)));
+        }
+        return List.copyOf(result);
+    }
+
+    /** 描述与实例绑定在同一份快照内。 */
+    record ResolvedExtension(ExtensionDescriptor descriptor, Extension<?, ?> extension) {
     }
 
     private InitOutcome initializeOne(Extension<?, ?> extension) {

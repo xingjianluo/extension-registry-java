@@ -35,11 +35,13 @@ public final class ExtensionInvoker {
      */
     public static <I, O> List<ExtensionResult<O>> invokeAll(ExtensionRegistry registry,
                                                             String point, I input) {
-        // 一次取描述快照，保证本次调用视图一致。
-        List<ExtensionDescriptor> descriptors = registry.getExtensions(point);
-        List<ExtensionResult<O>> results = new ArrayList<>(descriptors.size());
+        // 一次取同一份不可变快照上的“描述 + 实例”绑定，保证整次调用视图一致；
+        // 调用期间发生注册、动态增删或开关切换都不影响本次结果，也不会读到中间视图。
+        List<ExtensionRegistry.ResolvedExtension> resolved = registry.resolveExtensions(point);
+        List<ExtensionResult<O>> results = new ArrayList<>(resolved.size());
 
-        for (ExtensionDescriptor d : descriptors) {
+        for (ExtensionRegistry.ResolvedExtension re : resolved) {
+            ExtensionDescriptor d = re.descriptor();
             if (d.state() == ExtensionState.FAILED) {
                 log.debug("跳过初始化失败扩展: id='{}'", d.id());
                 results.add(new ExtensionResult<>(d.id(), ExtensionState.FAILED, false, null, d.failure()));
@@ -50,7 +52,8 @@ public final class ExtensionInvoker {
                 results.add(new ExtensionResult<>(d.id(), ExtensionState.INITIALIZED, false, null, null));
                 continue;
             }
-            Extension<I, O> extension = registry.getExtension(d.id());
+            @SuppressWarnings("unchecked")
+            Extension<I, O> extension = (Extension<I, O>) re.extension();
             O value = null;
             Throwable error = null;
             try {

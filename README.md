@@ -2,7 +2,9 @@
 
 在 Spring Boot 工程内提供一套扩展点（Extension Point）框架：同一扩展点下可注册多个实现，
 框架按**确定且可复现**的规则完成校验、排序、初始化，并支持运行期单独启用/禁用，
-同时保证故障隔离与并发安全。
+同时保证故障隔离与并发安全。在此基础上还支持**运行期动态新增/下线扩展实现**：
+不重启即可让新实现按既有依赖与顺序规则参与装配、调用，或把旧实现从扩展点彻底移除，
+整个调整以原子快照对外可见，校验或初始化失败时整批回滚、不影响线上视图。
 
 核心代码位于包 `com.github.xingjianluo.extensionregistryjava.extension`，
 Spring 集成位于其 `spring` 子包。
@@ -77,20 +79,79 @@ Spring 集成位于其 `spring` 子包。
   - 返回列表与该扩展点上的扩展一一对应、顺序即装配顺序。
   - 只需要成功结果时使用 `invokeEnabled(...)`。
 
-调用期间获取一次快照，调用过程中发生注册或开关切换不影响本次调用结果。
+调用期间获取一次快照，调用过程中发生注册、动态增删或开关切换不影响本次调用结果。
 
 ---
 
-## 5. 并发安全
+## 5. 运行期动态新增 / 下线（不重启调整）
 
-- 注册由 `ReentrantLock` 串行化，对外状态保存在不可变快照中、以 `volatile` 发布；
-- 注册、开关切换可与查询、调用并发；查询结果始终一致，不出现重复实例；
+在已启动的注册表上可继续调整，入口均在 `ExtensionRegistry`：
+
+| 方法 | 语义 |
+| --- | --- |
+| `add(ext)` / `addAll(list)` | 运行期**原子新增**：整批校验 + 初始化全部成功后才发布 |
+| `unregister(id)` / `unregisterAll(ids)` | 运行期**原子下线**：从查询与调用结果中彻底移除 |
+
+### 5.1 新增
+
+- 新扩展按**与启动期完全相同**的一套确定性规则参与装配：依赖优先 → 声明 `order()`
+  升序 → `id()` 字典序；因此无论增删过多少次，无依赖关系的实现之间始终按声明顺序排列；
+- 新增扩展依赖现有扩展、或同批扩展互相依赖都允许，被依赖者先初始化；
+- 与启动期 `registerAll` 的唯一差别是**失败策略**：运行期调整采用整批事务——
+  校验失败（重复 id `DuplicateExtensionException`、悬空依赖 `DanglingDependencyException`、
+  依赖环 `DependencyCycleException`）或任一新增扩展 `initialize()` 失败
+  （`ExtensionInitializationException`）时，**整批不发布**，调整前视图照常可查可调，
+  已尝试初始化的实例随失败批次一并丢弃（不进入注册表）。启动期 `registerAll`
+  仍保持原有“单扩展故障隔离、其余照常装配”的语义不变。
+
+### 5.2 下线与依赖保护
+
+- 下线后扩展从该扩展点的 `getExtensions` / `getEnabledExtensions` /
+  `ExtensionInvoker` 结果中**彻底消失**，`getDescriptor(id)`、`getExtension(id)` 返回
+  null/空，不保留半生效状态；
+- **依赖保护**：只要仍有“保留下来的”扩展依赖某个待下线扩展，本次下线请求被整体拒绝
+  （`ExtensionInUseException`，异常上带 `extensionId()` 与 `dependents()` 依赖方列表），
+  不做任何部分下线，依赖关系不会被破坏；需要连依赖方一起移除时，把它们放进
+  **同一次 `unregisterAll`**（同批一起移除的扩展之间不再视为“仍在依赖”）；
+- 对未注册/已下线 id 下线抛 `ExtensionNotRegisteredException`（是
+  `IllegalArgumentException` 子类，与 `setEnabled` 对未知 id 的拒绝类型保持一致）；
+  同一下线列表里出现重复 id 抛 `IllegalArgumentException`。
+
+### 5.3 实例与状态语义（已定死、前后一致）
+
+- **未被影响的扩展不重复初始化**：增删批次只初始化真正新增的扩展，其余扩展沿用原实例、
+  原 `INITIALIZED/FAILED` 状态，之前用 `setEnabled` 设置过的启用位也原样保留；
+- **移除后再加入 = 全新实例**：下线会把扩展实例、初始化结果、启用位全部清除，注册表
+  **不缓存已下线实例**。同一 id 再加回来时必须重新提交一个扩展对象，框架按全新扩展
+  重新初始化一次、默认启用；不会复用旧对象、不继承执行计数等残留状态，也绝不存在
+  “同一标识两个实例”。因此第一次提交时初始化失败的批次被回滚后，需要重新构造对象再提交；
+- 新增批次仍在事务内：失败回滚不会触碰任何既有扩展。
+
+### 5.4 并发可见性
+
+- 新增、下线与查询、调用共用同一把锁串行化，结果仍通过不可变快照 `volatile` 原子发布；
+- 调用方只能看到“调整前”或“调整后”其中一个**完整视图**，不会看到“新扩展已能查到、
+  但依赖它的那个还没就绪”之类的中间态；`ExtensionInvoker` 的一次调用自始至终绑定同一份
+  快照（描述与实例一次取齐），调用期间发生的调整不影响本次结果；
+- 并发下重复新增同一 id 会以 `DuplicateExtensionException` 拒绝、重复下线会以
+  `ExtensionNotRegisteredException` 拒绝，这是正常的竞争失败，不破坏已发布视图。
+
+---
+
+## 6. 并发安全
+
+- 注册、运行期新增/下线由 `ReentrantLock` 串行化，对外状态保存在不可变快照中、以
+  `volatile` 发布；
+- 注册、动态增删、开关切换可与查询、调用并发；查询结果始终一致，不出现重复实例或
+  装配中间视图；
 - 并发 40 线程注册 40 个扩展的场景下，每个扩展恰好一个实例、恰好初始化一次，
-  最终顺序与注册到达顺序无关（只由规则决定）。
+  最终顺序与注册到达顺序无关（只由规则决定）；
+- 并发多线程反复新增/下线同一扩展、同时持续调用的场景下，调用方只观察到完整视图
+  （详见 `DynamicAdjustmentTest`）。
 
 ---
 
-## 6. 配置项
+## 7. 配置项
 
 ```properties
 # extension.enabled.<扩展id>=true|false
@@ -102,7 +163,7 @@ extension.enabled.some-extension=false
 
 ---
 
-## 7. 使用示例
+## 8. 使用示例
 
 定义两个扩展，`discount-vip` 依赖 `discount-base`：
 
@@ -144,22 +205,68 @@ List<Double> prices = ExtensionInvoker.invokeEnabled(registry, "price-discount",
 registry.setEnabled("discount-vip", false);
 ```
 
+运行期不重启动态新增/下线（新实现同样按依赖与声明顺序参与装配）：
+
+```java
+// 运行期新增一个依赖 discount-base 的实现；校验或初始化失败会整批回滚
+registry.add(new StdDiscount());           // id=discount-std, order=50, deps=[discount-base]
+List<Double> prices2 = ExtensionInvoker.invokeEnabled(registry, "price-discount", order);
+
+// 仍被其它扩展依赖时下线会被拒绝，避免弄坏依赖关系
+try {
+    registry.unregister("discount-base");
+} catch (ExtensionInUseException e) {
+    // e.dependents() 给出仍在依赖它的扩展，例如 [discount-vip, discount-std]
+}
+
+// 连依赖方一起整批下线则允许；之后查询与调用里彻底没有这两个 id
+registry.unregisterAll(List.of("discount-base", "discount-vip", "discount-std"));
+
+// 同一 id 重新加回：必须提交新实例，按全新扩展重新初始化、默认启用，不残留旧状态
+registry.add(new StdDiscount());
+```
+
+> 与静态装配的兼容范围：启动期 Spring Bean 装配、`register/registerAll`、配置驱动开关、
+> 故障隔离等既有行为与异常类型全部保持不变；动态能力只是在同一份注册表上叠加
+> `add/addAll` 与 `unregister/unregisterAll`，排序规则、快照模型、一次性初始化承诺完全复用。
+
 ---
 
-## 8. 可观测性
+## 9. 可观测性
 
-每次装配后通过 SLF4J 打印装配顺序与判定依据（装配位、id、扩展点、声明顺序、
-依赖集合、最终状态、启用位）；`ExtensionRegistry#getLastAssemblyReport()`
-返回结构化的 `AssemblyReport`（含每条 `AssemblyRecord` 的判定原因）。
+每次装配（含每次动态增删后的重新装配）后通过 SLF4J 打印装配顺序与判定依据（装配位、id、
+扩展点、声明顺序、依赖集合、最终状态、启用位），动态增删另有一行汇总日志
+（新增/移除了哪些 id、未受影响扩展保持原实例/状态/开关）；
+`ExtensionRegistry#getLastAssemblyReport()` 返回结构化的 `AssemblyReport`
+（含每条 `AssemblyRecord` 的判定原因）。
 单测日志同时重定向落盘到 `target/surefire-reports/*-output.txt`。
 
 ---
 
-## 9. 测试覆盖
+## 10. 测试覆盖与本地验证
+
+### 10.1 测试覆盖
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
 | `AssemblyOrderingTest` | 声明顺序、id 破平、依赖优先、重复标识、悬空依赖、依赖成环（含自环）、失败后无部分装配 |
 | `LifecycleAndIsolationTest` | 初始化失败隔离、禁用稳定结果、反复切换不重复初始化/无残留、失败扩展调用语义、未知 id 拒绝 |
 | `ConcurrentAccessTest` | 并发注册无重复实例且只初始化一次、并发调用+切换快照一致 |
-| `SpringIntegrationTest` | Bean 收集装配、配置驱动开关、失败隔离、重复 id 启动失败原因可区分 |
+| `DynamicAdjustmentTest` | 动态新增参与排序与调用、下线彻底消失、依赖保护拒绝/整批连坐可移除、未知/重复下线拒绝、未受影响扩展不重复初始化且保留开关、移除后再加为新实例、非法图与初始化失败整批回滚旧视图可用、多轮调整顺序确定且连跑两遍一致、并发增删只见完整视图 |
+| `SpringIntegrationTest` | Bean 收集装配、配置驱动开关、失败隔离、重复 id 启动失败原因可区分、Spring 容器内运行期增删与静态装配兼容 |
+
+### 10.2 本地怎么验证
+
+```bash
+# 编译 + 全量单测（建议连续执行两遍，确认结果稳定、可复现）
+mvn test
+mvn test
+
+# 只看动态能力相关用例
+mvn test -Dtest=DynamicAdjustmentTest
+```
+
+- 控制台与 `target/surefire-reports/*-output.txt` 中可看到每个用例的
+  “装配位[index] id=... declaredOrder=... dependencies=... state=... enabled=... 判定依据: ...”
+  以及“运行期新增完成 / 运行期下线完成”汇总，据此核对装配顺序与判定依据；
+- 判定依据规则：被依赖者优先；无约束时 `declaredOrder` 升序；再相同按 id 字典序。
